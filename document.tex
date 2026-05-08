@@ -1,0 +1,204 @@
+\documentclass[11pt]{article}
+
+% Change "review" to "final" to generate the final (sometimes called camera-ready) version.
+\usepackage[final]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{float}
+
+\title{Pixels to Predictions: A Multi-Iteration Approach to Visual Multiple-Choice Reasoning with a 500M-Parameter VLM}
+
+\author{Tanish Vardhineni \\
+  New York University \\
+  \texttt{tv2291@nyu.edu} \\\And
+  Apoorva Menon \\
+  New York University \\
+  \texttt{as22037@nyu.edu} \\}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We tackle the NYU Deep Learning Spring 2026 Vision Challenge: predicting answers for science multiple-choice questions that combine a diagram, a question, optional context (lecture and hint), and a list of candidate answers. The competition imposes strict constraints --- only the provided checkpoint (\texttt{HuggingFaceTB/SmolVLM-500M-Instruct}) is allowed, the trainable parameter budget is capped at 5M, no external data may be used, and inference must run offline in a free-tier compute environment. Within these constraints, we describe a multi-iteration pipeline combining bf16 LoRA fine-tuning, multiple-choice log-likelihood scoring, choice-shuffle augmentation, OCR-augmented prompts, choice-permutation test-time augmentation, and multi-adapter ensembling. Our pipeline went through two major notebook generations (V1 with three back-to-back runs, V2 with OCR-augmented mega-runs) and produced a best legitimate single-adapter submission at \textbf{0.90342} public-leaderboard accuracy, climbing from rank 20 to within 1.6 points of the legitimate leader. We document the entire iteration log, including six distinct bugs and several principled experiments that nevertheless regressed performance.
+\end{abstract}
+
+\section{Introduction}
+
+The Pixels to Predictions task requires answering science multiple-choice questions where each example pairs an image (a diagram, map, chart, or photograph) with a textual question, an optional lecture and hint, and 2--5 candidate answers. The leaderboard metric is plain classification accuracy on a held-out test set. The dataset is a derivative of ScienceQA \cite{lu2022scienceqa}, spanning grades 1--12 across natural science, social science, and language science, with question types ranging from simple visual identification (``Which state is farthest north?'') to multi-step reasoning over Punnett squares, magnetic-force diagrams, and concentration tables.
+
+The constraints make this fundamentally a small-model problem. \texttt{SmolVLM-500M-Instruct} is built on a SigLIP-base vision encoder and a SmolLM-2 language model decoder. With 5M trainable parameters we cannot fine-tune the vision tower meaningfully, and we cannot fall back to a larger model when the small one fails to read fine-grained image content. Our approach therefore emphasized squeezing maximum signal out of the language-model side --- careful LoRA placement, prompt engineering, OCR augmentation to inject image text directly into the prompt, and test-time tricks --- rather than scaling capacity. The starter notebook provided a zero-shot baseline of 47.5\% on a 200-row validation slice; we will use this as the floor against which all subsequent gains are measured.
+
+\section{Dataset and Preprocessing}
+
+The competition release contained 3{,}109 train, 1{,}048 validation, and 1{,}008 test examples, distributed across three subjects (73\% natural science, 24\% social science, 3\% language science). Choice counts varied: 43\% of test rows have 3 choices, 27\% have 2, 26\% have 4, and 4\% have 5. The training-set answer distribution is heavily skewed --- always-pick-0 yields 36.15\% accuracy, always-pick-mode on val yields 33.11\% --- a positional bias we addressed with augmentation rather than by relying on the model to discover it.
+
+\subsection{Prompt Construction}
+We adopted a chat-template format keyed to the SmolVLM processor. Each prompt contains, in order: the image (rendered as image tokens by the processor), an optional context block concatenating the truncated \texttt{lecture} (1{,}200 chars max) and \texttt{hint} (600 chars max), the question, the choices labelled \texttt{A. B. C. D.}, and the closing instruction ``\texttt{Answer with a single letter only.}'' The assistant turn during training is exactly one letter, and at inference we score the next-token logits over the candidate-letter token IDs and take the argmax. We never used \texttt{model.generate} at inference: log-likelihood scoring is faster, deterministic, and strictly more accurate for MCQ than parsing free-form generations from a 500M model.
+
+\subsection{Choice-Shuffle Augmentation}
+Because the training set has substantial positional bias on the answer index, we randomly permute the choices for every training example on every epoch and re-target the answer letter accordingly. This simple trick destroys the trivial ``always pick A'' shortcut and forces the model to read the option text rather than memorize positions.
+
+\subsection{OCR-Augmented Prompting}
+A central observation from inspecting validation errors was that many natural-science questions contain numerical labels embedded in the diagram (forces in newtons, distances in centimeters, concentrations in mol/L). SmolVLM's 384$\times$384 vision tower struggles to read this fine print. We pre-computed OCR text for every train, validation, and test image using \textbf{EasyOCR} on GPU (later replaced with DocTR after a PaddlePaddle infrastructure failure --- see Section~\ref{sec:engineering}) and stored the result in \texttt{ocr\_text.json}. The text is filtered by confidence ($\geq 0.3$), truncated to 500 characters per image, sorted in approximate reading order (top-to-bottom, then left-to-right), and inserted into the prompt as a new context block: ``\texttt{Text extracted from image (via OCR): \dots}''. Coverage on the test set: 52.3\% of images produced non-empty OCR with the EasyOCR cache. A second cache produced via DocTR raised coverage to 64.3\% on test.
+
+\section{Model Architecture}
+
+We applied LoRA \cite{hu2022lora} to the SmolLM-2 language model side of SmolVLM, leaving the SigLIP vision tower frozen. After empirical comparison we settled on $r=8$, $\alpha=16$, $\text{dropout}=0.05$, with target modules \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}, \texttt{gate\_proj}, \texttt{up\_proj}, and \texttt{down\_proj}. The resulting trainable parameter count is exactly \textbf{4{,}161{,}536} ($\approx$0.81\% of the 511.6M total parameters), comfortably under the 5M cap (programmatically asserted in every training cell). All training used bf16 mixed precision on Google Colab A100 (80GB) instances.
+
+The training objective masks every prompt token with \texttt{-100} and computes cross-entropy only on the single answer-letter token in the assistant turn. This yields a sharp, single-target gradient signal, eliminates teacher-forcing leakage, and matches the inference scoring protocol exactly.
+
+\section{Engineering}
+\label{sec:engineering}
+
+Our path to 0.90342 was anything but smooth. Two notebook generations were required (we call them V1 and V2), several weeks of work were spent battling infrastructure issues, and we hit ensembling phenomena that contradicted intuition.
+
+\subsection{Notebook V1: Three Runs in Sequence}
+The first generation (\texttt{DL\_FINAL\_Train.ipynb}, 60 cells) housed three training runs back-to-back in a single Colab session: Run~A (seed-42 baseline), Run~B (seed-7 with 512px and attention+MLP LoRA), and Run~C (chain-of-thought continuation from Run~B). Each run ran $\approx$3 hours at 3 epochs over 777 update steps, with a cosine schedule sized for that single run. The notebook also contained EDA and prompt-engineering cells that we re-used across all subsequent generations.
+
+\subsection{Notebook V2: OCR-Augmented Mega Runs}
+The second generation (\texttt{DL\_FINAL\_Train V2.ipynb}, 35 cells) added the OCR cache, expanded the training data to \texttt{train + 80\% val} ($N=3{,}737$, with 420 val rows held out as a monitor), and ran 8 full epochs with a single cosine schedule sized over all 3{,}736 update steps. This produced Run~E (seed 99) and, after a clean seed swap, Run~F (seed 11). Each V2 run took $\approx$9.2 hours overnight on a single A100 80GB.
+
+\subsection{The Triple-Quote Notebook Generator}
+Our first decision was to generate \texttt{train.ipynb} programmatically from a single Python script that defined cells as raw triple-quoted strings. This collided immediately with internal Python docstrings using \texttt{"""}: the outer wrapper terminated early. We resolved this by switching the outer wrappers to \texttt{r'''\dots'''} so the inner \texttt{"""} docstrings would no longer match.
+
+\subsection{The Image-Token Boundary Bug}
+Our first training cell computed prompt length using \texttt{processor.tokenizer(prompt)} and used that count to mask labels. This was wrong: the SmolVLM processor expands the \texttt{<image>} placeholder into hundreds of image tokens, which the tokenizer-only call does not see. Labels ended up shifted by hundreds of positions, training loss looked fine but the model was learning to predict the wrong tokens. The fix: re-encode the prompt-only text \emph{through the processor} (with the image attached) and use \texttt{input\_ids.shape[1]} as the boundary. After this fix, training loss collapsed from ``looks like memorization'' to actual signal, and a sanity-check cell now verifies the labels-kept count on a 2-row batch ($\approx$2--4 tokens).
+
+\subsection{The Mixed-Seed Run E}
+Our breakthrough Run E (the 0.90342 adapter) had a seeding bug we discovered post-hoc. The seed block was:
+\begin{verbatim}
+SEED = 44
+SEED_E = 99
+random.seed(SEED_E)
+np.random.seed(SEED_E)
+torch.manual_seed(SEED_E)
+torch.cuda.manual_seed_all(SEED_E)
+torch.cuda.manual_seed_all(SEED)  # overrides
+\end{verbatim}
+The trailing duplicate call overrode the CUDA RNG to 44 while every other source remained at 99. This had no negative effect (both are valid seeds) but it complicated our subsequent diversity-by-seed analysis when comparing E and F. Run F was launched with a corrected single-seed block.
+
+\subsection{Out-of-Memory in the Mega Run}
+Run E was launched with \texttt{micro\_bsz=8, grad\_accum=2}, gradient checkpointing disabled (to take advantage of A100 80GB). The first attempt crashed at the cross-entropy step with an OOM allocating 2.3GB on top of 77.8GB already in use. The cause: with image-token-expanded sequences plus OCR text, the logits tensor at \texttt{(B=8, T$\approx$2000, V$\approx$49000)} alone is roughly 1.5 GB in bf16, and the backward pass needs to keep activations for the full sequence. The fix was a two-line change: drop \texttt{micro\_bsz} to 4 with \texttt{grad\_accum=4} (effective batch unchanged at 16) and re-enable gradient checkpointing. Step time grew about 25\% but training fit comfortably in 40--55GB.
+
+\subsection{The Phase-2 CoT Argument-Order Bug}
+Our chain-of-thought experiment (training the model to output \texttt{"\{letter\}. \{solution\_text\}"}) crashed on the first training step with ``\texttt{build\_user\_text() got multiple values for argument 'max\_ctx'}''. The original \texttt{build\_user\_text} signature was \texttt{(row, max\_ctx, use\_lecture, use\_hint, choices=None)} but our CoT wrapper called it positionally with \texttt{(row, choices, max\_ctx=\dots)}, mapping \texttt{choices} into the \texttt{max\_ctx} slot. A one-line fix (passing \texttt{choices} by keyword) restored training, but the CoT objective itself underperformed --- see Section~\ref{sec:experiments}.
+
+\subsection{The PaddleOCR / DocTR Migration}
+Our second OCR cache was supposed to come from PaddleOCR with table detection, which we hoped would extract Punnett squares as proper grid text. Reality: \texttt{paddlepaddle-gpu==3.0.0b0} is a beta release and crashed the Colab kernel deterministically when run alongside a loaded PyTorch CUDA context. PaddleOCR's API had also recently broken backwards compatibility (\texttt{use\_angle\_cls} renamed to \texttt{use\_textline\_orientation}, \texttt{use\_gpu} removed). We migrated to \textbf{DocTR}, which is PyTorch-native and avoids the CUDA-context conflict, and used position-aware reading order. The resulting cache covered 64.3\% of test images vs.\ EasyOCR's 52.3\%.
+
+\section{Iterations and Results}
+\label{sec:experiments}
+
+We tracked five named training runs across the two notebook generations and submitted five Kaggle predictions. Table~\ref{tab:runs} summarizes the configurations and Table~\ref{tab:lb} the leaderboard outcomes.
+
+\begin{table}[H]
+  \centering
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llllc}
+    \toprule
+    \textbf{Run} & \textbf{Seed} & \textbf{Img} & \textbf{Notes} & \textbf{Val Acc} \\
+    \midrule
+    Zero-shot & --- & 224 & \texttt{SmolVLM-500M} as-is, n=200 & 47.50\% \\
+    A & 42 & 384 & 3 ep, attn+MLP LoRA $r{=}8$ & 76.72\% \\
+    B & 7  & 512 & 3 ep, attn+MLP $r{=}8$  & 77.29\% \\
+    C & 21 & 512 & CoT continuation from B & 73.81\% \\
+    \textbf{E} & 99 & 512 & 8 ep, OCR, train+val & \textbf{88.33\%} \\
+    F & 11 & 512 & 8 ep, OCR, train+val (seed swap) & 89.29\% \\
+    \bottomrule
+  \end{tabular}%
+  }
+  \caption{Training-run configurations. ``Val Acc'' is each run's monitor-set accuracy. For Runs A, B, C this is the full 1{,}048-row validation set. For Runs E, F the monitor is each run's own 420-row held-out subset (driven by its seed) since the rest of validation went into training; cross-run numerical comparison there is misleading.}
+  \label{tab:runs}
+\end{table}
+
+\begin{table}[H]
+  \centering
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llc}
+    \toprule
+    \textbf{Submission} & \textbf{Components} & \textbf{Public LB} \\
+    \midrule
+    A+B ensemble                 & TTA=4, mean logits      & 0.81891 \\
+    A+B+C ensemble               & TTA=4, mean logits      & 0.83098 \\
+    \textbf{Run E alone}         & \textbf{TTA=8, raw logits} & \textbf{0.90342} \\
+    Squeeze (E, TTA=12, log-sm)  & log-softmax avg, batch=32 & 0.89738 \\
+    E+F vanilla                  & TTA=8, mean logits      & 0.89121 \\
+    \bottomrule
+  \end{tabular}%
+  }
+  \caption{Submission history. Run E alone is our best legitimate score. Adding more adapters or modifying the inference pipeline both regressed accuracy.}
+  \label{tab:lb}
+\end{table}
+
+\subsection{Initial Run: Starter and Zero-Shot}
+The provided starter notebook performed a one-row generative inference example, decoding a few free-form tokens from \texttt{SmolVLM-500M-Instruct} and parsing them. We replaced this immediately with batched log-likelihood scoring on a 200-sample slice, yielding a 47.5\% zero-shot validation accuracy --- well above the 25\%-random or 33\%-always-mode baselines, but far short of competitive. This served as the floor for every subsequent training experiment.
+
+\subsection{Run A and Run B: Two-Seed V1 Pipeline}
+Notebook V1 ran two adapters back-to-back in a single Colab session. Run~A used \texttt{seed=42} at \texttt{img\_size=384} with attention+MLP LoRA at $r{=}8$; Run~B used \texttt{seed=7} at \texttt{img\_size=512}. Both ran 3 epochs over 582 update steps with a per-run cosine schedule (\texttt{lr=2e-4} peak, 5\% warmup). After 3 hours each, A reached 76.72\% on full validation and B reached 77.29\%. The 512px bump in B contributed the expected diagram-reading boost ($\approx$+0.6 points). The 2-adapter ensemble (4-pass TTA, raw-logit averaging) achieved 0.81891 on the public leaderboard --- our first ranked submission.
+
+\subsection{Run C: Chain-of-Thought Continuation}
+Run C continued from Run B's adapter with a different objective: the assistant turn became \texttt{"\{letter\}. \{solution\_text\}"} (truncated at 400 chars) and the loss was computed over both the letter and the solution. The hope was that being forced to produce a coherent justification would improve letter accuracy. The reality: the loss was now averaged over $\approx$100 tokens rather than 1, diluting the gradient signal on the letter token by two orders of magnitude. Monitor accuracy dropped to 73.81\% (vs.\ B's 77.29\% starting point). Adding it to the ensemble produced a small public-LB gain (0.81891 $\to$ 0.83098) through error decorrelation, but C never recovered as a strong individual.
+
+\subsection{Run E: The Breakthrough}
+Run E lived in notebook V2 and combined every lever we had. The recipe: clean LoRA from base, seed=99, image size 512, 8 epochs, full cosine schedule sized correctly for the entire training horizon (so the LR did not decay to zero before the model finished learning), training data \texttt{= train + 80\% val} with the remaining 420 rows held out as a monitor split, and OCR-augmented prompts using the EasyOCR cache. The model trained for 9.2 hours overnight (3{,}736 update steps) and peaked at 88.33\% monitor accuracy at end of epoch 7, then dipped slightly at epoch 8 (a familiar overfitting signature). Submitted alone with TTA=8 and raw-logit averaging, Run E scored \textbf{0.90342} on the public leaderboard.
+
+\subsection{Run F: Same Recipe, Different Seed}
+Run F was an exact clone of Run E with the seeding mess fixed and \texttt{seed=11}. The intent was a clean second adapter for ensembling. Monitor trajectory looked stronger than E (89.29\% peak), but this was a measurement artifact: each run carves its monitor split using its own seed, so the 420 rows held out by F were a slightly easier sample than E's. On the actual test set, F was likely $\approx$2 points behind E. The ``vanilla'' E+F ensemble at TTA=8 scored 0.89121, regressing 1.2 points from Run E alone. Our error: we assumed monitor accuracy was a faithful proxy for test accuracy across runs; in fact, with seed-driven splits, monitor numbers are not directly comparable.
+
+\subsection{The Squeeze Submission}
+Between E and the E+F ensemble we attempted an inference-time ``squeeze'' on Run E alone: TTA bumped from 8 to 12, batch size 8 to 32, and raw-logit averaging replaced with log-softmax (geometric-mean-of-probabilities) averaging. Three changes at once. Result: 0.89738, a 0.6-point regression. The most likely culprit was log-softmax averaging interacting with bf16 numerical drift from the larger batch (which causes more padding and slightly different attention computations on borderline rows). Moral: change one variable at a time when the test set is your only validation oracle.
+
+\subsection{The Aborted Run G (PaddleOCR Retraining)}
+We never trained Run G. Our ambition was to retrain Run E's recipe using the higher-coverage PaddleOCR / DocTR cache. The diagnostic that talked us out of it: on the 134 test rows where OCR-trained and non-OCR-trained submissions \emph{disagree} (the rows where OCR is most likely to matter), the v2 OCR cache adds text on only 6 additional rows, and that text is mostly garbage (e.g.\ \texttt{'\%'}, \texttt{'A'}, \texttt{'L LI I I'}). The fundamental issue is that neither EasyOCR nor PaddleOCR can extract Punnett squares as structured grids --- they emit loose tokens. The bottleneck is structured visual reasoning, not text recognition; SmolVLM-500M's small SigLIP encoder is the limit, and no OCR upgrade reaches it.
+
+\section{Inference Pipeline}
+
+Our final inference pipeline has three components:
+
+\begin{enumerate}
+    \item \textbf{Multiple-choice log-likelihood scoring}: We construct the prompt with \texttt{add\_generation\_prompt=True} and read the next-token logits at position $-1$ (using left-padding for correct alignment). For each row we compare the logits at the candidate-letter token IDs and take the argmax. This protocol is deterministic, batchable, and significantly more accurate than parsing free-form generations from a 500M model. Letter token IDs were computed once at startup (e.g.\ \texttt{A}$\to$49, \texttt{B}$\to$50, \dots, \texttt{J}$\to$58 for the SmolVLM tokenizer).
+    \item \textbf{Choice-permutation TTA}: For each test row we run $K{=}8$ random permutations of the choice list, project the logits back to the original index space, and average. This eliminates residual positional bias and reduces variance on borderline rows. We tried bumping to 12 and 16 in some experiments; gains plateaued past $K{=}8$.
+    \item \textbf{Per-adapter OCR consistency}: Adapters trained without OCR receive prompts without OCR text; adapters trained with OCR receive the same OCR-augmented prompts they saw during training. Mixing the two is out-of-distribution and hurts.
+\end{enumerate}
+
+We deliberately avoided several inference tricks that initially seemed promising and turned out to regress on the leaderboard: log-softmax averaging across passes; multi-OCR-length TTA (running with 300, 500, and 700 character truncations and averaging); and naive equal-weight ensembling of OCR-trained and non-OCR-trained adapters.
+
+\section{Diagnostic Analysis}
+
+After Run E we performed a detailed analysis of where remaining errors live, comparing OCR and non-OCR submissions on the 134 rows where they disagree. The disagreements are heavily concentrated in five categories: \emph{Genes to traits} (Punnett squares, 49\% disagreement rate), \emph{Velocity, acceleration, and forces} (40\%), \emph{Solutions} (37\%), \emph{Astronomy} (30\%), and \emph{Magnets} (22\%). These are precisely the question types that require reading numerical labels off rendered diagrams --- exactly where a 500M-parameter VLM with a 384$\times$384 SigLIP encoder is weakest. We attempted higher-resolution inference (img\_size=768) but the resulting distribution shift hurt more than it helped.
+
+A second analysis, motivated by the hypothesis that some questions are answerable from text context alone, found that only 5--6\% of rows have exactly one choice text that appears verbatim in the lecture or hint, and even there the rule is only 85--89\% accurate --- not enough margin to beat the trained model. Hard-negative-mining curricula (upsampling rows the best model gets wrong) was prepared but not executed: the prerequisite \texttt{val\_predictions.csv} was never persisted by the training notebooks, and the runs that did persist it (Runs E and F) had already saturated their monitor sets.
+
+\section{Conclusion}
+
+We document a full iteration log spanning two notebook generations, five named training runs, five leaderboard submissions, six distinct bugs, and several principled experiments that nevertheless regressed performance. Our best legitimate submission (Run E alone, TTA=8, raw-logit averaging) scored \textbf{0.90342} on the public leaderboard. The single largest contributors were OCR augmentation ($\approx$+7 points over no-OCR), training on combined train+validation data ($\approx$+1.5), an 8-epoch schedule sized correctly for the data, and choice-shuffle augmentation that prevented positional-bias shortcutting.
+
+Several lessons from this work are likely to generalize. First: when test submissions are the only validation oracle, change exactly one variable per experiment; multi-knob attempts (the squeeze submission) hurt us. Second: monitor accuracy from per-run held-out splits is not directly comparable across runs; we mistook Run F for stronger than Run E and built an ensemble on that false premise. Third: ensembles only help when individual components are roughly equal in strength on the test set --- adding a weaker model with diverse errors is theoretically helpful but in practice we observed regressions every time. Fourth: OCR is highly task-specific; for ScienceQA, where many ``hard'' questions are Punnett squares and force diagrams that no current general-purpose OCR can structure-parse, additional OCR coverage delivers diminishing returns. The remaining gap to the legitimate leaderboard maximum is, we believe, structural visual reasoning capacity in a 500M model with a 384$\times$384 vision tower, not data or training procedure.
+
+\section*{Code (Github)}
+The full source code, including both notebook generations, OCR preprocessing scripts, ensembling pipeline, and submission histories, is available at \url{https://github.com/tanish-tc/DeepLearning-final.git}.
+
+\bibliographystyle{acl_natbib}
+\begin{thebibliography}{1}
+
+\bibitem{lu2022scienceqa}
+Pan Lu, Swaroop Mishra, Tony Xia, Liang Qiu, Kai-Wei Chang, Song-Chun Zhu, Oyvind Tafjord, Peter Clark, and Ashwin Kalyan.
+\newblock Learn to Explain: Multimodal Reasoning via Thought Chains for Science Question Answering.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2022.
+
+\bibitem{hu2022lora}
+Edward~J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+\newblock LoRA: Low-Rank Adaptation of Large Language Models.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2022.
+
+\end{thebibliography}
+
+\end{document}
